@@ -14,7 +14,7 @@ litellm
 
 
 streamlit
-
+pysqlite3-binary
 crewai
 
 
