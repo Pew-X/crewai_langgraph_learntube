@@ -1,32 +1,30 @@
 # Core LangChain and LangGraph
-langchain>=0.1.0
-langgraph>=0.0.26
-langchain-community>=0.0.13
-langchain-core>=0.1.12
+langchain==0.3.27
+langchain-community==0.3.27
+langchain-core==0.3.72
+langgraph==0.6.0
 
-# LangGraph Checkpointing (CRITICAL - I missed these!)
-langgraph-checkpoint>=2.1.0
-langgraph-checkpoint-sqlite>=2.0.11
+# LangGraph Checkpointing (CRITICAL for SqliteSaver)
+langgraph-checkpoint==2.1.1
+langgraph-checkpoint-sqlite==2.0.11
 
 # LLM Provider Support
-langchain-openai>=0.0.2  
-langchain-google-genai>=0.0.1  
-langchain-ollama>=0.1.0  
-langchain-groq>=0.1.0
-litellm>=1.0.0
+langchain-groq==0.3.6
+langchain-ollama==0.3.6
+litellm==1.74.3
 
 # Streamlit Framework
-streamlit>=1.29.0
+streamlit==1.47.1
 
 # CrewAI Multi-Agent Framework
-crewai>=0.28.0
+crewai==0.150.0
 
 # Environment & Configuration
-python-dotenv>=1.0.0
+python-dotenv==1.1.1
 
 # HTTP Requests (for Apify API calls)
-requests>=2.31.0
+requests==2.32.4
 
-# Data Validation
-pydantic>=2.5.0
-typing-extensions>=4.8.0
+# Data Validation & Core Dependencies
+pydantic==2.11.7
+typing-extensions==4.14.1
