@@ -32,7 +32,7 @@ python-dateutil
 
 loguru
 
-# JSON handling
+
 orjson
 
 
@@ -40,12 +40,12 @@ apify-client
 beautifulsoup4
 lxml
 
-
+langgraph-checkpoint-sqlite
 tavily-python
 
 
 gunicorn  
-psutil>=5.9.0  
+psutil 
 
 langchain-groq
 python-dotenv
