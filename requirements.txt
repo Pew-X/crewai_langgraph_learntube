@@ -6,7 +6,7 @@ langchain-community>=0.0.13
 langchain-core>=0.1.12
 requests
 
-
+langgraph-checkpoint-sqlite
 langchain-openai>=0.0.2  
 langchain-google-genai>=0.0.1  
 langchain-ollama>=0.1.0  
