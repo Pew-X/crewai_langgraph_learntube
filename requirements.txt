@@ -2,7 +2,7 @@ langchain
 langchain-community
 langchain-core
 langgraph
-
+pysqlite3-binary
 langgraph-checkpoint-sqlite
 langchain-groq
 langchain-ollama
