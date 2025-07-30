@@ -35,7 +35,7 @@ loguru
 
 orjson
 
-
+sqlite3>=3.35.0
 apify-client
 beautifulsoup4
 lxml
