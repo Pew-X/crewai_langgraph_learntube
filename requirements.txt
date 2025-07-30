@@ -1,51 +1,50 @@
 
 
-langchain>=0.1.0
-langgraph>=0.0.26
-langchain-community>=0.0.13
-langchain-core>=0.1.12
+langchain
+langgraph
+langchain-community
+langchain-core
 requests
 
 
-langchain-openai>=0.0.2  
-langchain-google-genai>=0.0.1  
-langchain-ollama>=0.1.0  
-litellm>=1.0.0 
+langchain-openai  
+langchain-google-genai 
+langchain-ollama 
+litellm 
 
 
-streamlit>=1.29.0
+streamlit
+
+crewai
 
 
-crewai>=0.28.0
+python-dotenv
 
 
-python-dotenv>=1.0.0
+requests
+typing-extensions
+pydantic
 
 
-requests>=2.31.0
-typing-extensions>=4.8.0
-pydantic>=2.5.0
+validators
+python-dateutil
 
 
-validators>=0.22.0
-python-dateutil>=2.8.2
-
-
-loguru>=0.7.2
+loguru
 
 # JSON handling
-orjson>=3.9.10
+orjson
 
 
-apify-client>=1.6.0
-beautifulsoup4>=4.12.2
-lxml>=4.9.3
+apify-client
+beautifulsoup4
+lxml
 
 
-tavily-python>=0.3.0
+tavily-python
 
 
-gunicorn>=21.0.0  
+gunicorn  
 psutil>=5.9.0  
 
 langchain-groq
