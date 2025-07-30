@@ -105,25 +105,27 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("🤖 Thinking..."):
                     try:
-                        # Prepare state
-                        initial_state = {
-                            "messages": [st.session_state.HumanMessage(content=prompt)],
-                            "user_profile": {},
-                            "linkedin_url": None,
-                            "job_role": None,
-                            "user_query": prompt,
-                            "profile_data": None,
-                            "profile_scraped": False,
-                            "analysis_results": None,
-                            "job_description": None,
-                            "job_fit_report": None,
-                            "rewritten_section": None,
-                            "next_action": None
-                        }
+                        # # Prepare state
+                        # initial_state = {
+                        #     "messages": [st.session_state.HumanMessage(content=prompt)],
+                        #     "user_profile": {},
+                        #     "linkedin_url": None,
+                        #     "job_role": None,
+                        #     "user_query": prompt,
+                        #     "profile_data": None,
+                        #     "profile_scraped": False,
+                        #     "analysis_results": None,
+                        #     "job_description": None,
+                        #     "job_fit_report": None,
+                        #     "rewritten_section": None,
+                        #     "next_action": None
+                        # }
+
+                        input_for_graph = {"messages": [st.session_state.HumanMessage(content=prompt)]}
                         
                         # Execute graph
                         result = st.session_state.graph.graph.invoke(
-                            initial_state,
+                            input_for_graph, #initial_state,
                             config=st.session_state.config
                         )
                         
@@ -174,3 +176,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

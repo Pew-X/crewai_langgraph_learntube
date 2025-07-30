@@ -67,6 +67,23 @@ class LinkedInAnalysisAgents:
                 self.llm = "gemini/gemini-1.5-flash"
                 logger.info("Using Gemini 1.5 Flash for enhanced conversational quality")
         
+        elif llm_provider == "groq":
+            # === GROQ CONFIGURATION (FAST INFERENCE OPTION) ===
+            # Ultra-fast inference with competitive pricing
+            groq_api_key = os.getenv("GROQ_API_KEY")
+            groq_model = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+            
+            if not groq_api_key or groq_api_key == "your_groq_api_key_here":
+                logger.warning("No valid GROQ API key found, falling back to Ollama")
+                llm_provider = "ollama"
+            else:
+                # Set environment variable for GROQ (required by litellm)
+                os.environ["GROQ_API_KEY"] = groq_api_key
+                
+                # Use GROQ for CrewAI (string format)
+                self.llm = f"groq/{groq_model}"
+                logger.info(f"Using GROQ model: {groq_model} for ultra-fast inference")
+        
         if llm_provider == "ollama":
 
             base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
