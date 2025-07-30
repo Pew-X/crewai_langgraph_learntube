@@ -3,6 +3,7 @@ langchain==0.3.27
 langchain-community==0.3.27
 langchain-core==0.3.72
 langgraph==0.6.0
+sqlite3>=3.35.0
 
 # LangGraph Checkpointing (CRITICAL for SqliteSaver)
 langgraph-checkpoint==2.1.1
