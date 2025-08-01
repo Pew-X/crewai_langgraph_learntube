@@ -39,7 +39,7 @@ def main():
             st.session_state.messages.append({"role": "assistant", "content": welcome_message})
 
     if BACKEND_AVAILABLE:
-        if prompt := st.chat_input("Paste your LinkedIn URL or ask a follow-up question..."):
+        if prompt := st.chat_input("Paste your LinkedIn Profile text or ask a follow-up question..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
