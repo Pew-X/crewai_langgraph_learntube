@@ -1,626 +1,521 @@
 
+
 import json
 import sqlite3
-from typing import TypedDict, List, Literal, Optional, Dict, Any, Annotated
+import re
+from typing import TypedDict, List, Optional, Annotated , Literal
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-from crewai import Task, Crew  # Import CrewAI for direct node execution
-from agents import TaskExecutor
+from crewai import Task, Crew
+from agents import LinkedInAnalysisAgents
+from langchain_core.prompts import ChatPromptTemplate ,PromptTemplate
+from langchain_core.output_parsers import StrOutputParser , JsonOutputParser
+from tools import get_linkedin_data_tool
 import logging
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 class GraphState(TypedDict):
-    """State schema for LinkedIn optimization graph with native LangGraph memory"""
-    
-    linkedin_url: Optional[str]
-    job_role: Optional[str]
-    user_query: Optional[str]
-    
-    
-    profile_data: Optional[dict]
-    profile_scraped: bool
-    
-    
-    analysis_results: Optional[str]
-    job_description: Optional[str]
-    job_fit_report: Optional[str]
-    rewritten_section: Optional[str]
-    
-    #  LangGraph memory 
     messages: Annotated[List[BaseMessage], add_messages]
-    
-    # User profile for personalization
-    user_profile: Dict[str, Any]
-    
-    # Control flow
+    profile_data: Optional[dict]
+    profile_scraped: bool = False
     next_action: Optional[str]
 
 
 
 
-
 class LinkedInOptimizationGraph:
-    """LangGraph implementation for LinkedIn profile optimization workflow with native memory"""
-    
     def __init__(self):
-        """Initialize the graph with task executor and SQLite memory"""
-        self.task_executor = TaskExecutor()
-        
-        # Initialize SQLite memory 
-        try:
-            
-            self.conn = sqlite3.connect("linkedin_optimizer_memory.db", check_same_thread=False)
-            self.memory = SqliteSaver(self.conn)
-            self.memory.setup()  
-            logger.info("SQLite memory initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize SQLite memory: {str(e)}")
-    
-            self.conn = sqlite3.connect(":memory:", check_same_thread=False)
-            self.memory = SqliteSaver(self.conn)
-            self.memory.setup()
-            logger.info("Using in-memory SQLite as fallback")
-        
-        
+        self.agents = LinkedInAnalysisAgents()
+        self.llm = self.agents.llm # Share the same LLM instance
+        self.conn = sqlite3.connect("memory.sqlite", check_same_thread=False)
+        self.memory = SqliteSaver(self.conn)
         self.graph = self._build_graph()
-        logger.info("LinkedIn Optimization Graph initialized with persistent memory")
-    
-    def _extract_user_info(self, message_content: str, current_profile: Dict[str, Any]) -> Dict[str, Any]:
-        """Enhanced user info extraction - reading directly from state"""
-        content = message_content.lower()
-        profile = current_profile.copy()
+        logger.info("LinkedIn Optimization Graph initialized correctly.")
+
+    def _create_contextual_prompt_data(self, state: GraphState) -> dict:
+        """
+        The Memory & Context Engine V2.
+        This function processes the raw message history into a clean, structured, and
+        artistically formatted string for injection into agent prompts.
+        """
+        logger.info("--- HELPER: V2 Creating Contextual Prompt Data ---")
         
+        #  the latest user message
+        latest_user_message = ""
+        if state["messages"] and isinstance(state["messages"][-1], HumanMessage):
+            latest_user_message = state["messages"][-1].content
+
+        #  TEMPORALLY ENUMERATED recent turn-by-turn history
+        recent_turns_text = ""
+        last_few_messages = state["messages"][-6:] # last 3 pairs of user/assistant
+        if last_few_messages:
+            formatted_turns = []
+            # We enumerate backwards from T-0 (the latest message)
+            for i, msg in enumerate(reversed(last_few_messages)):
+                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+                content = msg.content.replace('\n', ' ').strip()
+                content = content[:300] + "..." if len(content) > 300 else content
+                formatted_turns.append(f"[T-{i}] {role}: \"{content}\"")
+            recent_turns_text = "\n".join(reversed(formatted_turns)) # Reverse back to chronological
+            
         
-        name_patterns = [
-            r"i'm ([a-zA-Z\s]+)(?:,|\.|!|\s)",
-            r"my name is ([a-zA-Z\s]+)(?:,|\.|!|\s)",
-            r"i am ([a-zA-Z\s]+)(?:,|\.|!|\s)",
-            r"this is ([a-zA-Z\s]+)(?:,|\.|!|\s)",
-            r"hi.*i'm ([a-zA-Z\s]+)(?:,|\.|!|\s)"
-        ]
+        conversation_summary = "This is the beginning of our conversation."
+        if len(state["messages"]) > 2:
+            
+            full_history_script = ""
+            for msg in state['messages']:
+                role = "User" if isinstance(msg, HumanMessage) else "AI Career Coach"
+                full_history_script += f"{role}: {msg.content}\n---\n"
+                
+            summarizer_agent = self.agents.conversation_summarizer_agent()
+            summary_task = Task(
+                description=f"""
+                Analyze the following conversation script between a User and an AI Career Coach.
+                Your task is to produce a detailed, possibly multi-paragraph narrative summary from the AIs perspective.
+                This summary is CRITICAL for other AI agents to understand the conversational context so be thorough.
+                Capture the key information:
+                - **User Identity:** Who is the user? (e.g., "The user is John Doe, a Software Engineer at Google.")
+                - **Core Goal:** What is their primary objective in this conversation? (e.g., "His core goal is to transition from his current role into a Director-level Product Management position.")
+                - **Accomplished Steps:** What has been discussed or achieved so far? (e.g., "We have already performed an initial profile analysis and identified a key weakness in his project descriptions.")
+                - **Current Focus:** What is the immediate topic of conversation, based on the last few exchanges? (e.g., "He is now asking for a detailed career roadmap.")
+
+                CONVERSATION SCRIPT:
+                {full_history_script}
+                """,
+                agent=summarizer_agent,
+                expected_output="A detailed, possibly multi-paragraph narrative summary covering conversational context, the users identity, core goal, accomplished steps, and current focus."
+            )
+            crew = Crew(agents=[summarizer_agent], tasks=[summary_task]) 
+            conversation_summary = str(crew.kickoff()).strip()
+
         
-        import re
-        for pattern in name_patterns:
-            match = re.search(pattern, content, re.IGNORECASE)
-            if match:
-                potential_name = match.group(1).strip().title()
-               
-                if len(potential_name) >= 2 and all(c.isalpha() or c.isspace() for c in potential_name):
-                    profile["name"] = potential_name
-                    break
-        
-        
-        role_patterns = {
-            "data scientist": ["data scientist", "data science"],
-            "software engineer": ["software engineer", "developer", "programmer"],
-            "product manager": ["product manager", "pm"],
-            "analyst": ["analyst", "business analyst"],
-            "machine learning engineer": ["ml engineer", "machine learning engineer", "ai engineer"]
+        return {
+            "latest_user_question": latest_user_message,
+            "conversation_summary": conversation_summary,
+            "recent_conversation_turns": recent_turns_text,
+            # Now we pass the intelligently parsed data
+            "profile_data_json": json.dumps(state.get("profile_data"), indent=2) if state.get("profile_data") else "Not yet provided by the user."
         }
-        
-        for role_key, role_variations in role_patterns.items():
-            for variation in role_variations:
-                if variation in content:
-                    profile["current_role"] = role_key.title()
-                    break
-        
-    
-        company_patterns = ["netflix", "google", "microsoft", "apple", "amazon", "meta", "facebook", "tesla", "uber"]
-        
-        for company in company_patterns:
-            if f"at {company}" in content or f"work for {company}" in content or f"working at {company}" in content:
-                profile["company"] = company.title()
-                break
-        
-        return profile
-    
+
     def _build_graph(self) -> StateGraph:
-        """Build and compile the LangGraph workflow"""
-        
-        
         workflow = StateGraph(GraphState)
-        
-        
-        workflow.add_node("router", self.route_user_input_node)
+        workflow.add_node("router", self.intelligent_router_node)
         workflow.add_node("process_data", self.process_data_node)
         workflow.add_node("analyze_profile", self.analyze_profile_node)
-        workflow.add_node("analyze_job", self.analyze_job_node)
-        workflow.add_node("generate_job_fit", self.generate_job_fit_node)
-        workflow.add_node("enhance_content", self.enhance_content_node)
-        workflow.add_node("chat_response", self.chat_response_node)
+        workflow.add_node("analyze_job_fit", self.analyze_job_fit_node)
+        workflow.add_node("provide_career_path", self.provide_career_path_node)
+        workflow.add_node("general_chat", self.general_chat_node)
         
-        # entry point
         workflow.set_entry_point("router")
+        workflow.add_conditional_edges("router", lambda x: x["next_action"], {
+            "process_data": "process_data", "analyze_profile": "analyze_profile",
+            "analyze_job_fit": "analyze_job_fit", "provide_career_path": "provide_career_path",
+            "general_chat": "general_chat", "end": END
+        })
         
-        # conditional edges from router
-        workflow.add_conditional_edges(
-            "router",
-            self.route_decision,
-            {
-                "process_data": "process_data",
-                "analyze_profile": "analyze_profile", 
-                "analyze_job": "analyze_job",
-                "generate_job_fit": "generate_job_fit",
-                "enhance_content": "enhance_content",
-                "chat_response": "chat_response",
-                "end": END
-            }
+        # workflow.add_edge("process_data", "analyze_profile")
+
+        workflow.add_edge("process_data", END)
+        workflow.add_edge("analyze_profile", END)
+        workflow.add_edge("analyze_job_fit", END)
+        workflow.add_edge("provide_career_path", END)
+        workflow.add_edge("general_chat", END)
+        
+        return workflow.compile(checkpointer=self.memory)
+
+
+
+
+    def intelligent_router_node(self, state: GraphState) -> dict:
+        logger.info("--- NODE: Intelligent Router ---")
+        
+        # Get the latest message to analyze for this turn
+        latest_message = state["messages"][-1]
+        
+        #  If a profile hasn't been scraped yet AND the user just provided one,
+        # force the process_data node. This is the most reliable way.
+        if not state.get("profile_scraped"):
+            # latest_content = latest_message.content.lower()
+            
+            # if isinstance(latest_message, HumanMessage) and ("linkedin.com/in/" in latest_content):
+            #     logger.info("--- ROUTING (Rule-Based Profile Detection): 'PROCESS_DATA' ---")
+                return {"next_action": "process_data"}
+
+        # all other cases, use the intelligent AI-based router.
+       
+        
+        # 1. Get the clean, structured context from our Memory Engine helper.
+        prompt_data = self._create_contextual_prompt_data(state)
+        
+        agent = self.agents.intelligent_router_agent()
+
+    
+        task_description = f"""
+        You are an expert AI router for a LinkedIn career coach chatbot.
+        Your task is to analyze the conversation context and the users latest message to decide which specialist tool to use next.
+
+        === CONVERSATION SUMMARY ===
+        {prompt_data['conversation_summary']}
+        
+        === RECENT CONVERSATION TURNS (The users last message is at the end) ===
+        {prompt_data['recent_conversation_turns']}
+
+        === ROUTING GUIDE ===
+        Based on the users very latest message and the conversation context and summary, choose the most appropriate tool for the next action.
+
+        Here is the users latest question:
+        "{prompt_data['latest_user_question']}"
+
+        Now based on the above context and current question, choose ONE of the following tools appropriately:
+
+        - "analyze_profile": Use this for a general profile review, feedback, or questions like "how can I improve my profile?".
+        - "analyze_job_fit": Use this if the user provides a job description OR asks to be compared against a specific job title/role. Their SUITABILITY, FIT, or if their BACKGROUND IS ENOUGH for a specific job title. Use this for direct job comparison questions. (e.g., "am I a good fit for a Senior Engineer?").
+        - "provide_career_path": Use this if the user asks for a career roadmap, guidance on reaching a new role (e.g., "how do I become a CTO?"), or skill gap analysis.
+        - "general_chat": Use this for anything else: greetings, simple follow-up questions, thank yous, or anything that doesn't cleanly fit the above categories. Basically general chatbot like chat.
+
+        Your final answer MUST be ONLY ONE of these exact tool names:
+        
+        analyze_profile
+        analyze_job_fit
+        provide_career_path
+        general_chat
+        """
+        
+        task = Task(
+            description=task_description,
+            agent=agent,
+            expected_output="A single string containing only ONE of the allowed tool names."
         )
         
-    
-        workflow.add_edge("process_data", "analyze_profile")
-        workflow.add_edge("analyze_profile", END)
-        workflow.add_edge("analyze_job", "generate_job_fit")
-        workflow.add_edge("generate_job_fit", END)
-        workflow.add_edge("enhance_content", END)
-        workflow.add_edge("chat_response", END)
-        
-        # Compile with SQLite checkpointer 
-        compiled_graph = workflow.compile(checkpointer=self.memory)
-        
-        return compiled_graph
-    
-    def route_user_input_node(self, state: GraphState) -> GraphState:
-        """
-        Router node that determines next action
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            GraphState: Updated state with next action
-        """
-        next_action = self.route_decision(state)
-        return {**state, "next_action": next_action}
-    
-    def route_decision(self, state: GraphState) -> Literal["process_data", "analyze_profile", "analyze_job", "generate_job_fit", "enhance_content", "chat_response", "end"]:
-        """
-        Enhanced router - relies on LangGraph state management with better user info detection
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            str: Name of the next node to execute
-        """
-        logger.info("Routing user input...")
-        
-        # Get conversation history 
-        conversation_history = state.get("messages", [])
-        
-        
-        user_profile_from_conversation = {}
-        for msg in conversation_history:
-            if isinstance(msg, HumanMessage):
-                user_profile_from_conversation = self._extract_user_info(msg.content, user_profile_from_conversation)
-        
-        
-        if user_profile_from_conversation.get("name") or user_profile_from_conversation.get("current_role"):
-            logger.info(f"Found user profile info: {user_profile_from_conversation}, routing to chat response")
-            return "chat_response"
-        
-       
-        has_profile_data = state.get("profile_scraped", False) or state.get("profile_data") is not None
-        
-        
-        if not has_profile_data and conversation_history:
-            last_message = conversation_history[-1]
-            if isinstance(last_message, HumanMessage):
-                content = last_message.content.lower()
-                if any(keyword in content for keyword in ["linkedin.com", "http", "www.", "url"]):
-                    logger.info("Found LinkedIn URL, routing to data processing")
-                    return "process_data"
-        
-        
-        if has_profile_data and conversation_history:
-            last_message = conversation_history[-1]
-            if isinstance(last_message, HumanMessage):
-                message_content = last_message.content.lower()
-                
-              
-                if any(keyword in message_content for keyword in ["analyze", "review", "feedback", "suggestions"]):
-                    if not state.get("analysis_results"):
-                        logger.info("Routing to profile analysis")
-                        return "analyze_profile"
-                
-                
-                elif any(keyword in message_content for keyword in ["job", "role", "position", "career", "fit", "match"]):
-                    if not state.get("job_description"):
-                        logger.info("Routing to job analysis")
-                        return "analyze_job"
-                    else:
-                        logger.info("Routing to job fit generation")
-                        return "generate_job_fit"
-                
-               
-                elif any(keyword in message_content for keyword in ["rewrite", "improve", "enhance", "optimize", "update", "better"]):
-                    logger.info("Routing to content enhancement")
-                    return "enhance_content"
-        
-        
-        logger.info("Routing to chat response - conversational")
-        return "chat_response"
-    
-    def process_data_node(self, state: GraphState) -> GraphState:
-        """
-        Node for processing LinkedIn profile data (URL or text)
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            GraphState: Updated state with profile data
-        """
-        logger.info("Executing data processing node")
-        
-        
-        input_data = state.get("linkedin_url") or state.get("user_query", "")
-        
-        if not input_data:
-            return {
-                **state,
-                "messages": [
-                    AIMessage(content="I need either a LinkedIn profile URL or your LinkedIn profile text to get started. Please provide one of these.")
-                ]
-            }
-        
-        
-        result = self.task_executor.process_linkedin_data(input_data)
-        
+        # a temporary crew to get the routing decision.
+        crew = Crew(agents=[agent], tasks=[task], verbose=1)
+        decision = str(crew.kickoff()).strip().lower().replace('"', '').replace("'", "")
+
+        # fallback for safety
+        allowed_nodes = ["process_data", "analyze_profile", "analyze_job_fit", "provide_career_path", "general_chat"]
+        if decision not in allowed_nodes:
+            logger.warning(f"Router returned an invalid node '{decision}'. Defaulting to 'general_chat'.")
+            decision = "general_chat"
+
+        logger.info(f"--- ROUTING (AI-Based Crew): '{decision.upper()}' ---")
+        return {"next_action": decision}
+
+
+
+
+    def process_data_node(self, state: GraphState) -> dict:
+        logger.info("--- NODE: Processing Profile Data ---")
+        user_input = state["messages"][-1].content
+        tool = get_linkedin_data_tool()
+        result = tool.run(user_input)
+        # if "error" in result:
+        #     return {"messages": [AIMessage(content=f"Error processing data: {result['error']}")]}
+        # return {"profile_data": result.get("data"), "profile_scraped": True, "messages": [AIMessage(content="Profile data loaded successfully! Now, what would you like to do? For example: 'Analyze my profile' or 'How do I fit for a Senior Engineer role?'")]}
         if result.get("success"):
-            profile_data = result.get("data", {})
-            response_message = " Successfully processed your LinkedIn profile! I can now help you with:\n\n" \
-                             "• **Profile Analysis** - Get detailed feedback on your profile\n" \
-                             "• **Job Fit Analysis** - Compare your profile against specific job roles\n" \
-                             "• **Content Enhancement** - Improve specific sections of your profile\n\n" \
-                             "What would you like me to help you with?"
-            
+        # If and ONLY if the tool explicitly signals success...
+            logger.info("Tool successfully processed a profile.")
+            # ...do we update the state and return the success message.
             return {
-                **state,
-                "profile_data": profile_data,
+                "profile_data": result.get("data"),
                 "profile_scraped": True,
-                "messages": [AIMessage(content=response_message)]
-            }
-        elif result.get("requires_text_input"):
-            error_message = f" {result.get('error', 'Unable to process URL')}\n\n" \
-                          "**Alternative**: Please copy and paste your LinkedIn profile text directly, and I'll analyze it for you.\n\n" \
-                          " **Tip**: You can copy your profile text from LinkedIn and paste it here for analysis."
-            
-            return {
-                **state,
-                "messages": [AIMessage(content=error_message)]
+                "messages": [AIMessage(content="Profile data loaded successfully! Now, what would you like to do? For example: 'Analyze my profile' or 'How do I fit for a Senior Engineer role?'")]
             }
         else:
-            error_message = f" Failed to process the LinkedIn profile: {result.get('error', 'Unknown error')}\n\n" \
-                          "Please try:\n" \
-                          "• Checking that the URL is a valid LinkedIn profile URL\n" \
-                          "• Copying and pasting your LinkedIn profile text directly\n" \
-                          "• Making sure your profile is public if using a URL"
-            
-            return {
-                **state,
-                "messages": [AIMessage(content=error_message)]
-            }
+            prompt_data = self._create_contextual_prompt_data(state)
+        agent = self.agents.general_chat_agent()
+
+        
+        task_description = f"""
+        **OPERATIONAL BRIEFING: Conversational Interface Management**
+
+        You are an the Empathetic AI Career Coach. Your job is to have a natural, helpful conversation.
+
+        **CONTEXT:** The system just attempted to process the users latest message as a LinkedIn profile, but it failed The users profile has NOT been loaded.
+
+        **USERs LATEST MESSAGE:**
+        "{prompt_data['latest_user_question']}"
+
+        **MISSION:**
+        Your goal is to respond conversationally to the users latest message. Acknowledge what they said, but since the profile processing failed, you must gently guide them to provide a valid profile if thats whats needed to answer their question. Use your standard response protocol. For example, if they just said "hi", you should just say "hi" back and ask how you can help.
+        """
+        
+        task = Task(description=task_description, agent=agent, expected_output="A natural, helpful, and context-aware conversational response.")
+        crew = Crew(agents=[agent], tasks=[task])
+        
+        
+        # do NOT update profile_scraped, which is correct.
+        response_content = str(crew.kickoff())
+        return {"messages": [AIMessage(content=response_content)]}
+
     
-    def analyze_profile_node(self, state: GraphState) -> GraphState:
-        """
-        Simplified profile analysis node - reads directly from state
-        
-        Args:
-            state (GraphState): Current graph state with profile_data
-            
-        Returns:
-            GraphState: Updated state with analysis results
-        """
-        logger.info("Executing profile analysis node")
-        
-        # 1. READ the state dictionary
-        profile_data = state.get("profile_data")
-        conversation_history = state.get("messages", [])  #  history here!
-        user_profile = state.get("user_profile", {})
 
-        if not profile_data:
-            return {
-                "messages": [AIMessage(content="I need your profile data first. Please provide your LinkedIn URL.")]
-            }
+    def analyze_profile_node(self, state: GraphState) -> dict:
+        logger.info("--- NODE: Analyzing Profile ---")
+        
+        # Ensure profile data exists.
+        if not state.get("profile_data"): 
+            return {"messages": [AIMessage(content="To analyze your profile, I first need it! Could you please provide your LinkedIn URL or paste the profile text?")]}
 
-        # 2. HIRE THE AGENT and build the task prompt 
-        agent = self.task_executor.agents.profile_analyzer_agent()
+        
+        prompt_data = self._create_contextual_prompt_data(state)
+        
+        agent = self.agents.profile_analyzer_agent()
+        
+       
+        task_description = f"""
+
+        (YOU ARE PART OF A MULTI AGENTIC WORKFLOW CULMINATING AS A USER FACING CONVERSATIONAL CHATBOT WHERE YOU ARE ONE OF THE AGENTS)
+
+        **OPERATIONAL BRIEFING: Profile Audit & Strategic Review**
+        You are a Senior LinkedIn Strategist & Brand Consultant. Your task is to perform a detailed and actionable analysis of the users LinkedIn profile.
+
+
+        === CURRENT USER QUERY ===
+
+         THE USERs LATEST QUERY: 
+        
+        "{prompt_data['latest_user_question']}".
+
+        === CURRENT USER QUERY ===
+
+        === CONTEXT OF OUR CONVERSATION ===
+        {prompt_data['conversation_summary']}
+        
+        === RECENT CONVERSATION TURNS ===
+        {prompt_data['recent_conversation_turns']}
+
+        === USERs FULL PROFILE DATA ===
+        {prompt_data['profile_data_json']}
+
+        
+        
+        **MISSION:**
+
+        Your mission is to conduct a professional-grade audit of their LinkedIn profile. Your output MUST be a structured report, written in a direct, authoritative, and consultative tone. **You must address the user directly in second person conversationally as "you" and refer to their profile as "your profile"**.**Do not use platitudes or generic praise. Your analysis must be insightful and actionable.**
+
+        1.  **EXECUTIVE SUMMARY:**
+             - A blunt, one-paragraph assessment of the profiles current state.
+             - Clearly state its primary strength and its most critical weakness from a strategic branding perspective.
+
+        2.  **STRATEGIC ANALYSIS & ACTION PLAN:**
+            - **Headline & Summary Deconstruction:** Does their headline convey a clear value proposition or is it just a job title? Is their summary a compelling narrative or a lazy list of duties? Provide a rewritten example for BOTH the headline and the summary that is significantly more impactful.
+            - **Experience Section Deep Dive:** Are they describing accomplishments or just listing tasks? Identify the weakest experience entry and rewrite it using the STAR method (Situation, Task, Action, Result) to demonstrate how it should be done. Focus on quantifiable outcomes.
+            - **Skills & Endorsements Audit:** Are their skills aligned with their stated career goals (from the conversation summary)? List 3-5 critical skills they are missing and 3-5 skills they should remove as "noise".
+            - **Overall Brand Cohesion:** Does the profile tell a coherent story? Or is it a disjointed collection of facts? Provide a concluding paragraph on their overall personal brand strategy and how to improve it.
+
+        **CRITICAL DIRECTIVE:** Your analysis MUST be tailored based on the users stated goals in the conversation summary. If they want to be a Product Manager, your entire audit must be viewed through that lens. Every recommendation must push them closer to that goal.
+        """
+        
+        task = Task(
+            description=task_description, 
+            agent=agent, 
+            expected_output="A structured, professional-grade profile audit report with an executive summary and a detailed strategic action plan."
+        )
+        
+       
+        crew = Crew(agents=[agent], tasks=[task])
+        return {"messages": [AIMessage(content=str(crew.kickoff()))]}
+
+
+
+    def provide_career_path_node(self, state: GraphState) -> dict:
+        logger.info("--- NODE: Providing Career Path ---")
+        if not state.get("profile_data"): 
+            return {"messages": [AIMessage(content="To give you a personalized career path, I first need your LinkedIn profile. Could you please provide the URL or text?")]}
+
+        
+        prompt_data = self._create_contextual_prompt_data(state)
+        
+        agent = self.agents.career_path_agent()
         
         
         task_description = f"""
-Profile Analysis for LinkedIn Optimization:
+        (YOU ARE PART OF A MULTI AGENTIC WORKFLOW CULMINATING AS A USER FACING CONVERSATIONAL CHATBOT WHERE YOU ARE ONE OF THE AGENTS)
 
-=== USER PROFILE DETAILS ===
-Name: {user_profile.get('name', 'Not specified')}
-Current Role: {user_profile.get('current_role', 'Not specified')}
-Company: {user_profile.get('company', 'Not specified')}
+        **OPERATIONAL BRIEFING: Career Trajectory Architecture**
 
-=== CONVERSATION CONTEXT ===
-"""
-        # Add complete conversation context
-        for msg in conversation_history:  # Use FULL history, not truncated
-            if hasattr(msg, 'content'):
-                role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-                task_description += f"{role} said: {msg.content}\n"
+        You are an Executive Career Counselor & Leadership Mentor. Your task is to create a realistic, step-by-step career roadmap for the user.
+
+
+        <CURRENT USER QUERY>
+         THE USERs LATEST QUERY: 
         
-        task_description += f"""
+        "{prompt_data['latest_user_question']}".
+        </CURRENT USER QUERY>
 
-=== PROFILE CONTENT ===
-{json.dumps(profile_data, indent=2)}
-=== END OF PROFILE ===
+        # CONTEXT OF OUR CONVERSATION
 
-Analyze this LinkedIn profile and provide specific optimization recommendations.
+        ===CONVERSATION SUMMARY===
+        {prompt_data['conversation_summary']}
+        
+        === RECENT CONVERSATION TURNS & DIALOGUE ===
+        {prompt_data['recent_conversation_turns']}
 
-Focus on:
-1. **Profile Completeness**: Identify missing or weak sections
-2. **Professional Headline**: Assess clarity and impact
-3. **About Section**: Evaluate storytelling and value proposition
-4. **Work Experience**: Review achievement descriptions and impact metrics
-5. **Skills & Keywords**: Analyze relevance and optimization
-6. **Overall Strategy**: Assess alignment with career goals
+        === USERs PROFILE DATA ===
+        {prompt_data['profile_data_json']}
 
-Provide:
-✓ Specific strengths and areas for improvement
-✓ Actionable recommendations with examples
-✓ Keyword suggestions for better visibility
-✓ Strategic positioning advice
 
-Format your response with clear sections and specific examples.
-"""
+        **MISSION:**
+         As per the mentees latest request Your mission is to architect a realistic, multi-stage career roadmap to take them from their current position to their stated long-term goal. **You must address the user directly in second person conversationally as "you" and refer to their profile as "your profile"**. This is not a list of online courses; it is a strategic blueprint for career advancement. **You must address the user directly in second person conversationally as "you" and refer to their profile as "your profile"**. Your tone should be that of a seasoned mentor: wise, strategic, and focused on long-term value.
+            1.  **THE STRATEGIC OVERVIEW:**
+            - A summary of the journey, acknowledging the starting point and the destination.
+            - State the realistic estimated timeframe for this transition (e.g., "This is a 3-5 year journey requiring focused effort.").
+            - Identify the single biggest challenge they will face in this transition (e.g., "Your biggest challenge will be shifting perception from a 'technical doer' to a strategic leader.'").
 
-        task = Task(description=task_description, agent=agent, expected_output="Professional analysis with specific, actionable recommendations for LinkedIn profile optimization")
-        crew = Crew(agents=[agent], tasks=[task], memory=False)
-        analysis_results = crew.kickoff()
+        2.  **PHASE-BASED ACTION PLAN:**
+            - **Phase 1: Foundation (Next 6-12 Months):** Detail the immediate actions required. This should focus on leveraging their CURRENT role.
+                - *Skill Acquisition:* What 2-3 specific skills must they acquire? Be specific (e.g., "Master User Story mapping," not "Learn Agile").
+                - *Internal Visibility:* What kind of projects should they volunteer for *at their current company* to build relevant experience?
+            - **Phase 2: Transition (Years 1-3):** Detail the steps needed to make the first major move.
+                - *Target Role:* What is the logical "next-step" role? (e.g., "Associate Product Manager" or "Technical Product Manager").
+                - *Resume & Branding:* How must their personal brand and resume narrative evolve by this stage?
+                - *Networking:* What specific types of people should they be building relationships with? (e.g., "VPs of Product in B2B SaaS companies").
+            - **Phase 3: Acceleration (Years 3-5+):** Detail the strategy for growth *after* landing the transition role.
+                - *Performance Milestones:* What defines success in the new role to set them up for the next promotion?
+                - *Leadership Development:* What specific leadership competencies must be demonstrated to move towards their ultimate goal?
 
-        # 3. WRITE THE RESULT back 
-        return {
-            "analysis_results": analysis_results,
-            "messages": [AIMessage(content=f"📊 **LinkedIn Profile Analysis Complete**\n\n{analysis_results}")]
-        }
+        **CRITICAL DIRECTIVE:** Every piece of advice MUST be grounded in the mentees current reality as described in their profile. Constantly refer back to their existing skills and experience as the foundation for your recommendations.
+        """
+        
+        task = Task(description=task_description, agent=agent, expected_output="A detailed, multi-phase strategic career roadmap, providing a long-term, actionable blueprint for the user")
+        crew = Crew(agents=[agent], tasks=[task])
+        return {"messages": [AIMessage(content=str(crew.kickoff()))]}
     
-    def analyze_job_node(self, state: GraphState) -> GraphState:
-        """
-        Node for analyzing job descriptions
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            GraphState: Updated state with job analysis
-        """
-        logger.info("Executing job analysis node")
-        
-       
-        job_role = state.get("job_role")
-        if not job_role and state.get("messages"):
-            last_message = state["messages"][-1]
-            if isinstance(last_message, HumanMessage):
-                #  look for job titles in the message
-                message_content = last_message.content
-                job_role = message_content  # use the entire message as job role for now
-        
-        if not job_role:
-            return {
-                **state,
-                "messages": state.get("messages", []) + [
-                    AIMessage(content="Please specify the job role you're interested in for analysis.")
-                ]
-            }
-        
-       
-        job_description = self.task_executor.analyze_job_description(job_role)
-        
-        return {
-            **state,
-            "job_role": job_role,
-            "job_description": job_description
-        }
-    
-    def generate_job_fit_node(self, state: GraphState) -> GraphState:
-        """
-        Node for generating job fit report
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            GraphState: Updated state with job fit report
-        """
-        logger.info("Executing job fit analysis node")
-        
-        profile_data = state.get("profile_data")
-        job_description = state.get("job_description")
-        
-        if not profile_data or not job_description:
-            return {
-                **state,
-                "messages": state.get("messages", []) + [
-                    AIMessage(content="I need both profile data and job description to generate a fit report.")
-                ]
-            }
-        
-       
-        job_fit_report = self.task_executor.generate_job_fit_report(profile_data, job_description)
-        
-        response_message = f"🎯 **Job Fit Analysis Report**\n\n{job_fit_report}\n\n" \
-                          "Would you like me to help you improve any specific areas or rewrite sections of your profile?"
-        
-        return {
-            **state,
-            "job_fit_report": job_fit_report,
-            "messages": [AIMessage(content=response_message)]
-        }
-    
-    def enhance_content_node(self, state: GraphState) -> GraphState:
-        """
-        Node for enhancing profile content
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            GraphState: Updated state with enhanced content
-        """
-        logger.info("Executing content enhancement node")
-        
-        profile_data = state.get("profile_data")
-        job_description = state.get("job_description", "")
-        
-        if not profile_data:
-            return {
-                **state,
-                "messages": state.get("messages", []) + [
-                    AIMessage(content="I need your profile data to enhance content. Please provide a LinkedIn URL first.")
-                ]
-            }
-        
-       
-        last_message = state.get("messages", [])[-1] if state.get("messages") else None
-        section_type = "about"  
-        current_content = str(profile_data.get("about", ""))
-        
-        if last_message and isinstance(last_message, HumanMessage):
-            message_content = last_message.content.lower()
-            if "headline" in message_content:
-                section_type = "headline"
-                current_content = str(profile_data.get("headline", ""))
-            elif "experience" in message_content:
-                section_type = "experience"
-                current_content = str(profile_data.get("experience", ""))
-            elif "summary" in message_content or "about" in message_content:
-                section_type = "about"
-                current_content = str(profile_data.get("about", ""))
+
+    def analyze_job_fit_node(self, state: GraphState) -> dict:
+        logger.info("--- NODE: Analyzing Job Fit ---")
         
         
-        enhanced_content = self.task_executor.enhance_profile_content(
-            current_content, job_description, section_type
+        if not state.get("profile_data"): 
+            return {"messages": [AIMessage(content="I can definitely help with a job fit analysis, but I need your LinkedIn profile first. Could you please share it?")]}
+
+
+        prompt_data = self._create_contextual_prompt_data(state)
+        
+        agent = self.agents.job_fit_analyzer_agent()
+
+        
+        task_description = f"""
+        (YOU ARE PART OF A MULTI AGENTIC WORKFLOW CULMINATING AS A USER FACING CONVERSATIONAL CHATBOT WHERE YOU ARE ONE OF THE AGENTS)
+
+
+        **OPERATIONAL BRIEFING: Candidate-Role Fitment Analysis**
+
+        You are a Veteran Technical Recruiter & Hiring Manager. Your task is to provide a detailed comparison between the users profile and a specific job role or description.
+
+
+        <CURRENT USER QUERY>
+         THE USERs LATEST QUERY: 
+        
+        "{prompt_data['latest_user_question']}".
+        </CURRENT USER QUERY>
+
+        
+
+        === CONTEXT OF OUR CONVERSATION ===
+        {prompt_data['conversation_summary']}
+        
+        === RECENT CONVERSATION TURNS ===
+        {prompt_data['recent_conversation_turns']}
+
+        === USERs PROFILE DATA ===
+        {prompt_data['profile_data_json']}
+
+       **MISSION:**
+        As per the candidates latest request. Your mission is to perform a rigorous, unsentimental analysis of their profile against the target role.**You must address the user directly in second person conversationally as "you" and refer to their profile as "your profile"**. Your perspective is that of a gatekeeper deciding if this candidate is worth a 30-minute screening call. Your tone should be direct, professional, and based on evidence from their profile.
+        
+        Analyze the users profile against the job role mentioned in their latest request.
+
+        **CRITICAL INSTRUCTION:**
+        - If the users request contains a full job description, use that for a detailed, line-by-line comparison.
+        - If the users request ONLY contains a job title (e.g., "Senior Product Manager"), you must INFER a standard, industry-accepted job description for that title and perform the analysis against that inferred standard. State that you are doing so (e.g., "Based on a standard job description for a Senior Product Manager...").
+
+        1.  **THE BOTTOM LINE (HIRING DECISION):**
+            - Start with a single sentence: "Based on the provided information, my decision would be to [PASS ON / ADVANCE TO SCREENING] this candidate."
+            - Follow with a "Fitment Score" from 0% to 100%.
+
+        2.  **EVIDENCE-BASED RATIONALE:**
+            - **Signal (Reasons to Advance):** A bulleted list of the strongest points of alignment between their profile and the role. Each point must explicitly connect a specific part of their profile (e.g., "Their experience in 'Quantitative Research at J.P. Morgan'") to a requirement of the job.
+            - **Noise & Gaps (Reasons to Pass):** A bulleted list of the most significant gaps or weaknesses. Be specific. Instead of "lacks leadership experience," say "The profile provides no evidence of project leadership, team management, or mentorship, which is a critical requirement for this role."
+
+        3.  **STRATEGIC PREPARATION PLAN (If they were my candidate):**
+            - **Immediate Profile Edits:** Provide 2-3 specific, "copy-pasteable" rewrites for their profile summary or experience bullet points that would directly address the identified gaps for THIS job.
+            - **Interview Talking Points:** List 3 key talking points they MUST prepare to discuss in an interview to overcome the perceived weaknesses in their profile. For example: "Be prepared to discuss the 'XYZ project' and frame it as a leadership initiative, even if it wasn't official."
+
+        **CRITICAL DIRECTIVE:** If the user only provided a job title, you must first state what standard industry expectations you are using for that title before beginning your analysis.
+
+       """
+        
+        task = Task(
+            description=task_description,
+            agent=agent,
+            expected_output="A direct, evidence-based fitment report starting with a clear hiring decision and score, followed by a detailed rationale and a strategic preparation plan."
         )
         
-        response_message = f"✨ **Enhanced {section_type.title()} Section**\n\n{enhanced_content}\n\n" \
-                          "Would you like me to enhance any other sections or provide additional suggestions?"
         
-        return {
-            **state,
-            "rewritten_section": enhanced_content,
-            "messages": [AIMessage(content=response_message)]
-        }
-    
-    def chat_response_node(self, state: GraphState) -> GraphState:
-        """
-        Enhanced chat response node - implements proper state injection pattern
-        
-        Args:
-            state (GraphState): Current graph state
-            
-        Returns:
-            GraphState: Updated state with contextual chat response
-        """
-        logger.info("Executing enhanced chat response node with memory")
-        
+        crew = Crew(agents=[agent], tasks=[task])
+        return {"messages": [AIMessage(content=str(crew.kickoff()))]}
 
-        conversation_history = state.get("messages", [])  # Full history here!
-        user_profile = state.get("user_profile", {})
-        profile_data = state.get("profile_data", {})
+
+    def general_chat_node(self, state: GraphState) -> dict:
+        logger.info("--- NODE: General Chat ---")
         
        
-        if conversation_history:
-            last_message = conversation_history[-1]
-            if isinstance(last_message, HumanMessage):
-               
-                user_profile = self._extract_user_info(last_message.content, user_profile)
+        prompt_data = self._create_contextual_prompt_data(state)
         
-      
-        if not state.get("profile_scraped"):
-            # Build contextual task description 
-            agent = self.task_executor.agents.conversation_assistant_agent()
-            
-            #  STATE INJECTION 
-            task_description = f"""
-LinkedIn optimization consultation based on user context and conversation history.
+        agent = self.agents.general_chat_agent()
 
-=== USER PROFILE INFORMATION ===
-User's Name: {user_profile.get('name', 'Not provided')}
-User's Current Role: {user_profile.get('current_role', 'Not provided')}
-User's Company: {user_profile.get('company', 'Not provided')}
-Profile Status: {'Available' if profile_data else 'Not provided'}
-
-=== CONVERSATION HISTORY ===
-"""
-            # Inject ALL conversation history into the task description - NO TRUNCATION
-            for i, msg in enumerate(conversation_history, 1):
-                if hasattr(msg, 'content'):
-                    role = "User" if isinstance(msg, HumanMessage) else "Assistant" 
-                    task_description += f"Turn {i} - {role}: {msg.content}\n"
-            
-            task_description += f"""
-
-=== CURRENT USER QUERY ===
-{conversation_history[-1].content if conversation_history else "Initial consultation"}
-
-=== CONSULTATION REQUIREMENTS ===
-Provide a professional LinkedIn optimization response that:
-
-1. Uses available user context (name, role, company) appropriately
-2. References relevant conversation history when applicable  
-3. Delivers specific, actionable LinkedIn optimization advice
-4. Maintains professional tone while being personable
-5. Focuses on concrete recommendations and next steps
-
-Provide specific guidance tailored to their career situation and LinkedIn optimization needs.
-"""
-
-           
-            from crewai import Task, Crew
-            task = Task(
-                description=task_description, 
-                agent=agent, 
-                expected_output="Professional, contextual LinkedIn optimization advice with specific recommendations"
-            )
-            crew = Crew(agents=[agent], tasks=[task], memory=False)  
-            response = str(crew.kickoff())
-        else:
-           
-            response = f"""Great to continue our conversation{', ' + user_profile.get('name', '') if user_profile.get('name') else ''}!
-
-I can help you with LinkedIn optimization including:
-• Profile analysis and feedback
-• Job fit analysis for specific roles  
-• Content enhancement for profile sections
-• Career strategy and positioning
-
-What specific aspect would you like to focus on today?"""
         
-       
-        return {
-            "user_profile": user_profile,  # Update user profile in state
-            "messages": [AIMessage(content=response)]  # add_messages will handle appending
-        }
-    
-    def get_runnable(self):
-        """Get the compiled graph for execution"""
-        return self.graph
-    
-    def close(self):
-        """Close the SQLite connection"""
-        if hasattr(self, 'conn'):
-            self.conn.close()
-            logger.info("SQLite connection closed")
+        task_description = f"""
+
+        (YOU ARE PART OF A MULTI AGENTIC WORKFLOW CULMINATING AS A USER FACING CONVERSATIONAL CHATBOT WHERE YOU ARE THE GLUE THAT HOLDS THE USER EXPERIENCE TOGETHER. YOU ARE THE USER FACING AGENT THAT ENSURES THE USER NEVER FEELS LIKE THEY ARE BEING PASSED BETWEEN DIFFERENT BOTS. YOU ARE THE CENTRAL INTELLIGENCE OF THE CONVERSATION)
+
+        **OPERATIONAL BRIEFING: Conversational Interface Management**
+        You are an Empathetic AI Career Coach. Your job is to have a natural, helpful conversation.
+
+
+        <CURRENT USER QUERY>
+         THE USERs LATEST QUERY: 
+        
+        "{prompt_data['latest_user_question']}".
+        </CURRENT USER QUERY>
+
+        === CONTEXT OF OUR PREVIOUS CONVERSATION ===
+        {prompt_data['conversation_summary']}
+        
+        === RECENT CONVERSATION TURNS ===
+        {prompt_data['recent_conversation_turns']}
+
+        === USERs PROFILE DATA (If available) ===
+        {prompt_data['profile_data_json']}
+
+        **MISSION:**
+        As per the users latest message. Your primary goal is to maintain a coherent, helpful, and natural conversation. You are the "face" of the service.
+
+        **RESPONSE PROTOCOL:**
+
+        1.  **Acknowledge and Validate:** Always start by acknowledging the users last statement. Show you've understood it by referencing the context from the summary (e.g., "Thats a great follow-up question about the career path we were just discussing...").
+        2.  **Provide a Direct Answer:** If its a simple question you can answer, do so helpfully.
+        3.  **Guide if Necessary:**
+            - If the users question requires a profile and one hasn't been provided, you must gently guide them: "To give you the best possible answer for that, I'd need to understand your background. Could you please share your LinkedIn profile URL or text?"
+            - If the users question seems to hint at a more complex task (like a job fit or profile analysis), set the stage for it. For example: "It sounds like you're wondering how your profile stacks up against that role. Would you like me to perform a detailed Job Fit Analysis for you?"
+        4.  **Maintain Persona:** Your tone should always be encouraging, clear, and professional. End with an open-ended question to keep the conversation flowing naturally.
+
+       **CRITICAL DIRECTIVE:** You are the glue that holds the user experience together. Your main job is to ensure the user never feels like they are being passed between different bots. Be the consistent, central intelligence of the conversation.
+       **CRITICAL DIRECTIVE 2: DO NOT HALLUCINATE CAPABILITIES.**
+        If the user asks for something you cannot do (like search for live jobs, connect to a real person, or access external websites), you MUST state your limitation clearly and gracefully. Do NOT pretend to have specialists or tools that are not part of your core functions (profile analysis, job fit, career roadmaps). A good response would be: "While I can't search for live job postings, my expertise is in getting your profile ready for those applications.
+        """
+        
+        task = Task(description=task_description, agent=agent, expected_output="A natural, helpful, and context-aware conversational response that maintains user engagement and guides them appropriately.")
+        crew = Crew(agents=[agent], tasks=[task])
+        return {"messages": [AIMessage(content=str(crew.kickoff()))]}
+
 
 
 
 def create_linkedin_optimization_graph():
-    """Create and return the LinkedIn optimization graph"""
-    return LinkedInOptimizationGraph()
-
-
-# For testing
-if __name__ == "__main__":
-    graph = create_linkedin_optimization_graph()
-    print("LinkedIn Optimization Graph created successfully!")
+    return LinkedInOptimizationGraph().graph
