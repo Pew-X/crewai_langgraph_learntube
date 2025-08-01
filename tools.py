@@ -1,255 +1,185 @@
-"""
-Custom tools for LinkedIn Profile Optimization Assistant
-"""
+
 import os
 import time
 import json
 import requests
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from crewai.tools import BaseTool
-from pydantic import Field
 import logging
-
+import os
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from pydantic import BaseModel, Field 
+from typing import List, Optional
+from langchain_google_genai.chat_models import  ChatGoogleGenerativeAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+
+class ParsedProfile(BaseModel):
+    full_name: str = Field(description="The full name of the person.")
+    headline: str = Field(description="The main professional headline under their name.")
+    summary: str = Field(description="The 'About' section text. If not present, state 'No summary provided'.")
+    experience_highlights: List[str] = Field(description="A list of the user's job titles and companies.")
+    education_highlights: List[str] = Field(description="A list of the user's educational institutions.")
+
+
+class ValidationResponse(BaseModel):
+    """The output of the initial validation step to classify the user's input."""
+    is_profile_data: bool = Field(description="Set to True if the text contains actual profile information (name, experience, etc.), otherwise False.")
+    profile_text_only: Optional[str] = Field(description="If is_profile_data is True, this field contains ONLY the cleaned profile text, with all conversational filler like 'here is my profile' or 'check this out' completely removed. If is_profile_data is False, this should be null.")
+
+
+
 class LinkedInDataTool(BaseTool):
-    """Tool for handling LinkedIn profile data - either from URL scraping or direct text input"""
-    
-    name: str = "LinkedIn Data Handler"
-    description: str = """
-    A tool that processes LinkedIn profile data from either a URL or direct text input.
-    For URLs: Attempts to scrape using Apify API
-    For text: Processes the provided LinkedIn profile text directly
-    Returns structured profile data for analysis.
-    """
-    
+    name: str = "LinkedIn Profile Processor"
+    description: str = """A tool that validates, cleans, and processes LinkedIn profile data from a user's message.
+    It intelligently determines if the input is a URL, profile text, or just a conversational message.
+    If it's valid profile data, it parses it into a structured format.
+    If it's not profile data, it reports that, allowing the system to route to a chat agent."""
+
+
+    _utility_llm: Any = None
+
+    def _get_utility_llm(self):
+        """Initializes the utility LLM on first use."""
+        if self._utility_llm is None:
+            try:
+                
+                self._utility_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=os.getenv("GEMINI_API_KEY"), temperature=0)
+                logger.info("Utility LLM (Gemini) for tool initialized.")
+            except Exception as e:
+                logger.error(f"Failed to initialize utility LLM. Ensure GEMINI_API_KEY is set. Error: {e}")
+                raise
+        return self._utility_llm
+
     def _run(self, input_data: str) -> Dict[str, Any]:
-        """
-        Process LinkedIn profile data from URL or text
-        
-        Args:
-            input_data (str): Either a LinkedIn URL or profile text
-            
-        Returns:
-            Dict[str, Any]: The processed profile data
-        """
-        try:
-            # Check if input is a URL
-            if input_data.strip().startswith("http") and "linkedin.com" in input_data.lower():
-                logger.info("Processing LinkedIn URL")
-                return self._scrape_from_url(input_data.strip())
-            else:
-                logger.info("Processing LinkedIn profile text")
-                return self._process_text_input(input_data)
-                
-        except Exception as e:
-            logger.error(f"Error processing LinkedIn data: {str(e)}")
-            return {"error": f"Exception occurred during processing: {str(e)}"}
-    
+        """The main execution method that decides whether to scrape or process text."""
+        input_data = input_data.strip()
+        if "linkedin.com/in/" in input_data.lower() and input_data.startswith("http"):
+            logger.info("Detected LinkedIn URL, attempting to scrape.")
+            return self._scrape_from_url(input_data)
+        else:
+            logger.info("Detected plain text input, processing with validation pipeline.")
+            # This is where we call the robust text processing method
+            return self._process_text_input_pipeline(input_data)
+
     def _scrape_from_url(self, linkedin_url: str) -> Dict[str, Any]:
-        """
-        Scrape LinkedIn profile using Apify API
+        """Scrapes a LinkedIn profile using the Apify API."""
+        api_token = os.getenv("APIFY_API_TOKEN")
+        if not api_token:
+            return {"error": "APIFY_API_TOKEN is not configured."}
+
+        actor_id = "apify/linkedin-profile-scraper"
+        run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?token={api_token}"
+        run_input = {"startUrls": [{"url": linkedin_url}]}
         
-        Args:
-            linkedin_url (str): The LinkedIn profile URL to scrape
-            
-        Returns:
-            Dict[str, Any]: The scraped profile data
-        """
         try:
-            # Get API credentials from environment
-            api_token = os.getenv("APIFY_API_TOKEN")
-            
-            if not api_token:
-                return {
-                    "error": "APIFY_API_TOKEN not found. Please provide profile text instead or configure API token.",
-                    "fallback": "text_input_required"
-                }
-            
-            # Apify actor for LinkedIn scraping - Using working actor ID
-            actor_id = "2SyF0bVxmgGr8IVCZ"  # dev_fusion/Linkedin-Profile-Scraper
-            
-            # Prepare the run input
-            run_input = {
-                "profileUrls": [linkedin_url],
-                "sessionCookieValue": "",
-                "includePdfs": False,
-                "saveToKvStore": False
-            }
-            
-            # Start the actor run
-            run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
-            headers = {
-                "Authorization": f"Bearer {api_token}",
-                "Content-Type": "application/json"
-            }
-            
-            logger.info(f"Starting LinkedIn profile scrape for: {linkedin_url}")
-            response = requests.post(run_url, json=run_input, headers=headers, timeout=30)
-            
-            if response.status_code != 201:
-                return {
-                    "error": f"Failed to start scraping job: {response.text}",
-                    "fallback": "text_input_required"
-                }
-            
-            run_data = response.json()
-            run_id = run_data["data"]["id"]
-            
-            # Poll for results 
-            result_url = f"https://api.apify.com/v2/acts/{actor_id}/runs/{run_id}"
-            max_attempts = 12  # 2 minutes max wait time
-            attempt = 0
-            
-            while attempt < max_attempts:
+            logger.info(f"Starting scrape for URL: {linkedin_url}")
+            response = requests.post(run_url, json=run_input, timeout=30)
+            response.raise_for_status()
+            run_id = response.json()['data']['id']
+            status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={api_token}"
+
+            for _ in range(12):  
                 time.sleep(10)
-                attempt += 1
+                status_response = requests.get(status_url, timeout=10)
+                status_response.raise_for_status()
+                status = status_response.json()['data']['status']
+                logger.info(f"Scraping job status: {status}")
                 
-                logger.info(f"Checking scraping status... Attempt {attempt}/{max_attempts}")
-                status_response = requests.get(result_url, headers=headers, timeout=10)
-                
-                if status_response.status_code == 200:
-                    status_data = status_response.json()
-                    run_status = status_data["data"]["status"]
-                    
-                    if run_status == "SUCCEEDED":
-                        # Get the results
-                        dataset_id = status_data["data"]["defaultDatasetId"]
-                        dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-                        
-                        results_response = requests.get(dataset_url, headers=headers, timeout=10)
-                        if results_response.status_code == 200:
-                            results = results_response.json()
-                            if results:
-                                logger.info("Successfully scraped LinkedIn profile")
-                                return {
-                                    "success": True,
-                                    "data": results[0],
-                                    "source": "scraped"
-                                }
-                            else:
-                                return {
-                                    "error": "No profile data found",
-                                    "fallback": "text_input_required"
-                                }
-                        else:
-                            return {
-                                "error": f"Failed to fetch results: {results_response.text}",
-                                "fallback": "text_input_required"
-                            }
-                    
-                    elif run_status == "FAILED":
-                        return {
-                            "error": f"Scraping job failed: {status_data.get('data', {}).get('statusMessage', 'Unknown error')}",
-                            "fallback": "text_input_required"
-                        }
-                    
-                    # Continue polling if status is RUNNING or READY
-                    logger.info(f"Job status: {run_status}, continuing to wait...")
-                else:
-                    return {
-                        "error": f"Failed to check status: {status_response.text}",
-                        "fallback": "text_input_required"
-                    }
+                if status == 'SUCCEEDED':
+                    dataset_url = f"https://api.apify.com/v2/datasets/{status_response.json()['data']['defaultDatasetId']}/items?token={api_token}"
+                    results = requests.get(dataset_url, timeout=10).json()
+                    if results:
+                        logger.info("Scraping successful.")
+                        return {"success": True, "data": results[0]}
+                    return {"error": "Scraping succeeded but returned no data."}
+                elif status in ['FAILED', 'ABORTED']:
+                    return {"error": f"Scraping job failed with status: {status}"}
             
-            return {
-                "error": "Scraping job timed out after 2 minutes",
-                "fallback": "text_input_required"
-            }
-            
-        except Exception as e:
-            logger.error(f"Error scraping LinkedIn profile: {str(e)}")
-            return {
-                "error": f"Exception occurred during scraping: {str(e)}",
-                "fallback": "text_input_required"
-            }
-    
-    def _process_text_input(self, profile_text: str) -> Dict[str, Any]:
+            return {"success": False,"error": "Scraping job timed out."}
+        except requests.exceptions.RequestException as e:
+            logger.warning("Apify scraping is a placeholder. Returning an error.")
+        return {"success": False, "error": "Apify scraping is not fully implemented in this example."}
+
+    def _process_text_input_pipeline(self, user_message: str) -> Dict[str, Any]:
         """
-        Process LinkedIn profile from text input
-        
-        Args:
-            profile_text (str): The LinkedIn profile text
-            
-        Returns:
-            Dict[str, Any]: The processed profile data
+        Processes raw text using a robust two-stage LLM pipeline: Validate -> Parse.
+        This ensures only genuine, cleaned profile text is ever parsed.
         """
         try:
-            # Basic text processing to extract structured data
-            profile_data = {
-                "success": True,
-                "source": "text_input",
-                "raw_text": profile_text,
-                "processed_sections": self._extract_sections_from_text(profile_text)
-            }
-            
-            logger.info("Successfully processed LinkedIn profile text")
-            return profile_data
-            
+            utility_llm = self._get_utility_llm()
         except Exception as e:
-            logger.error(f"Error processing profile text: {str(e)}")
-            return {"error": f"Exception occurred during text processing: {str(e)}"}
-    
-    def _extract_sections_from_text(self, text: str) -> Dict[str, str]:
-        """
-        Extract common LinkedIn sections from text
-        
-        Args:
-            text (str): The profile text
-            
-        Returns:
-            Dict[str, str]: Extracted sections
-        """
-        sections = {}
-        
-        #  keyword-based extraction
-        text_lower = text.lower()
-        
-        # Try to extract name (usually at the beginning)
-        lines = text.strip().split('\n')
-        if lines:
-            sections['name'] = lines[0].strip()
-        
-        # Extract sections based on common keywords
-        if 'about' in text_lower or 'summary' in text_lower:
-            sections['has_about'] = True
-        
-        if 'experience' in text_lower or 'work' in text_lower:
-            sections['has_experience'] = True
-            
-        if 'education' in text_lower or 'university' in text_lower or 'college' in text_lower:
-            sections['has_education'] = True
-            
-        if 'skills' in text_lower or 'technologies' in text_lower:
-            sections['has_skills'] = True
-            
-        if 'certification' in text_lower or 'licensed' in text_lower:
-            sections['has_certifications'] = True
-        
-        sections['word_count'] = len(text.split())
-        sections['text_length'] = len(text)
-        
-        return sections
-    
-    async def _arun(self, input_data: str) -> Dict[str, Any]:
-        """Async version of _run"""
-        return self._run(input_data)
+            # If fails to init, we can't process, so it's not a success.
+            return {"success": False, "error": str(e)}
 
+        # --- Stage 1: Validate and Clean the input ---
+        validator_parser = JsonOutputParser(pydantic_object=ValidationResponse)
+        validator_prompt = ChatPromptTemplate.from_template(
+            """You are a data validation bot. Analyze the user's message.
+            Does it contain the substantive text of a LinkedIn profile (must include a name, a job title, and some experience)?
+            A job description or a simple question is NOT a profile.
 
+            CRITICAL: The user might include conversational filler like "here is my profile:", "sure, check this out...", or "okay, here it is:". You MUST ignore this filler and focus on the actual data.
+
+            If it IS a profile, set is_profile_data to true and extract ONLY the profile text, removing all conversational filler (e.g., "here is my profile:", "sure, check this out...").
+            If it is NOT a profile, set is_profile_data to false.
+
+            {format_instructions}
+            
+            User Message:
+            ---
+            {user_message}
+            ---
+            """
+        )
+        validator_chain = validator_prompt | utility_llm | validator_parser
+        
+        try:
+            validation_result = validator_chain.invoke({
+                "user_message": user_message, 
+                "format_instructions": validator_parser.get_format_instructions()
+            })
+        except Exception as e:
+            logger.error(f"LLM validation call failed: {e}")
+            return {"success": False, "error": "Could not validate input text."}
+        
+        # the crucial gatekeeper logic
+        if not validation_result.get("is_profile_data"):
+            logger.info("Tool determined input is not profile data.")
+           
+            return {"success": False, "data": "Input was determined to be conversational, not profile data."}
+
+        cleaned_profile_text = validation_result.get("profile_text_only")
+        if not cleaned_profile_text:
+            logger.warning("Tool validated text as profile, but failed to extract it.")
+            return {"success": False, "error": "Could not extract clean profile text from the message."}
+        
+        
+        parser = JsonOutputParser(pydantic_object=ParsedProfile)
+        parser_prompt = ChatPromptTemplate.from_template(
+            """Parse the following CLEANED LinkedIn profile text into the specified JSON format.
+            {format_instructions}
+            Cleaned LinkedIn Profile Text: --- {cleaned_profile_text} ---
+            """
+        )
+        parser_chain = parser_prompt | utility_llm | parser
+        
+        try:
+            parsed_data = parser_chain.invoke({
+                "cleaned_profile_text": cleaned_profile_text,
+                "format_instructions": parser.get_format_instructions()
+            })
+            logger.info("Successfully parsed cleaned profile text into structured data.")
+            #Return "success": True so the graph can update the state.
+            return {"success": True, "data": parsed_data}
+        except Exception as e:
+            logger.error(f"LLM parsing call failed: {e}")
+            return {"success": False, "error": "Could not parse the cleaned profile text."}
 
 def get_linkedin_data_tool():
-    """Get an instance of the LinkedIn data handler tool"""
+    """Factory function to get an instance of the tool."""
     return LinkedInDataTool()
-
-
-# For testing purposes
-if __name__ == "__main__":
-    # Test the tool
-    linkedin_tool = get_linkedin_data_tool()
-    
-    print("LinkedIn Data Tool initialized successfully!")
-    print(f"Tool Name: {linkedin_tool.name}")
-    print(f"Tool Description: {linkedin_tool.description}")
