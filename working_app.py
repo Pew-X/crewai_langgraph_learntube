@@ -33,7 +33,7 @@ def main():
                 st.markdown(msg["content"])
 
     if "messages" in st.session_state and not st.session_state.messages:
-        welcome_message = "👋 Welcome! To begin, please paste your full **LinkedIn Profile URL** or your profile text."
+        welcome_message = "👋 Welcome! To begin, please paste your full **LinkedIn Profile** text."
         with st.chat_message("assistant"):
             st.markdown(welcome_message)
             st.session_state.messages.append({"role": "assistant", "content": welcome_message})
