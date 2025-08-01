@@ -14,3 +14,4 @@ python-dotenv
 pydantic
 typing-extensions
 apify-client
+langchai-google-genai
